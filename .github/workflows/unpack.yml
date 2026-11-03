@@ -1,0 +1,148 @@
+name: chimera-unpack
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  unpack:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get tooling
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://download.sysinternals.com/files/Procdump.zip -OutFile pd.zip
+          Expand-Archive pd.zip -DestinationPath pd -Force
+          Invoke-WebRequest https://downloads.mitmproxy.org/11.1.3/mitmproxy-11.1.3-windows-x86_64.zip -OutFile mitm.zip
+          Expand-Archive mitm.zip -DestinationPath mitm -Force
+
+      - name: Baseline snapshot
+        shell: pwsh
+        run: |
+          $dirs = @("$env:TEMP","$env:ProgramData","$env:LOCALAPPDATA","$env:APPDATA","C:\Program Files","C:\Program Files (x86)","C:\Windows\System32\drivers")
+          $rows = foreach ($d in $dirs) { if (Test-Path $d) { Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue | Select-Object @{n='p';e={$_.FullName}}, Length } }
+          $rows | Export-Csv before.csv -NoTypeInformation -Encoding UTF8
+
+      - name: Run installer and dump
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Start-Process mitm\mitmdump.exe -ArgumentList '-p','8080','-w','flows.dump','--set','block_global=false','--set','connection_strategy=lazy','--set','flow_detail=3' -RedirectStandardOutput mitm.log
+          $reg = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+          Set-ItemProperty $reg ProxyEnable 1
+          Set-ItemProperty $reg ProxyServer "http=127.0.0.1:8080;https=127.0.0.1:8080"
+          Start-Sleep 6
+          $ca = "$env:USERPROFILE\.mitmproxy\mitmproxy-ca-cert.cer"
+          if (Test-Path $ca) { Import-Certificate -FilePath $ca -CertStoreLocation Cert:\LocalMachine\Root | Out-Null }
+          netsh trace start capture=yes tracefile=capture.etl maxsize=1024 | Out-Null
+          Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+          function Shot($f) {
+            $b = New-Object System.Drawing.Bitmap([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width,[System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height)
+            $g=[System.Drawing.Graphics]::FromImage($b); $g.CopyFromScreen(0,0,0,0,$b.Size); $b.Save($f); $g.Dispose(); $b.Dispose()
+          }
+          function DumpAll($tag) {
+            Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match 'chimera|setup|install|suf_|irsetup|auth|msiexec|rundll32|regsvr|dpinst|devcon' } | ForEach-Object {
+              $name = "$tag-$($_.ProcessName)-$($_.Id).dmp"
+              Write-Host "dump $($_.ProcessName) $($_.Id)"
+              & .\pd\procdump64.exe -accepteula -ma $_.Id $name 2>&1 | Out-File -Append pd.log
+              if ((Test-Path $name) -and (Get-Item $name).Length -gt 0) { "$($_.ProcessName)|$($_.Id)|$name" | Out-File -Append dumped.txt } else { Remove-Item $name -ErrorAction SilentlyContinue }
+            }
+          }
+          if (Test-Path installer.exe) {
+            Write-Host '=== installer.exe ==='
+            $p = Start-Process -FilePath '.\installer.exe' -PassThru
+            Start-Sleep 40
+            Shot 'i0.png'
+            Get-Process | Where-Object { $_.ProcessName -match 'chimera|setup|install|suf_' } | Format-Table Id,ProcessName,MainWindowTitle -AutoSize | Out-String | Write-Host
+            DumpAll 'inst'
+            Start-Sleep 30
+            Shot 'i1.png'
+            DumpAll 'inst2'
+            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          }
+          Start-Sleep 5
+          if (Test-Path authdrv.exe) {
+            Write-Host '=== authdrv.exe ==='
+            $p2 = Start-Process -FilePath '.\authdrv.exe' -PassThru
+            Start-Sleep 40
+            Shot 'a0.png'
+            Get-Process | Where-Object { $_.ProcessName -match 'suf_|setup|install|auth|chimera' } | Format-Table Id,ProcessName,MainWindowTitle -AutoSize | Out-String | Write-Host
+            DumpAll 'auth'
+            Start-Sleep 25
+            Shot 'a1.png'
+            DumpAll 'auth2'
+            if ($p2 -and -not $p2.HasExited) { Stop-Process -Id $p2.Id -Force -ErrorAction SilentlyContinue }
+          }
+          netsh trace stop | Out-Null
+          Start-Sleep 8
+          Get-DnsClientCache | Format-List | Out-File dnscache.txt
+          netstat -bno | Out-File netstat.txt
+          Get-Service | Where-Object { $_.Name -match 'chimera|hasp|sentinel|dongle|token|auth' } | Format-Table Name,DisplayName,Status,PathName -AutoSize | Out-String | Write-Host
+
+      - name: Filesystem diff
+        shell: pwsh
+        run: |
+          $dirs = @("$env:TEMP","$env:ProgramData","$env:LOCALAPPDATA","$env:APPDATA","C:\Program Files","C:\Program Files (x86)","C:\Windows\System32\drivers")
+          $rows = foreach ($d in $dirs) { if (Test-Path $d) { Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue | Select-Object @{n='p';e={$_.FullName}}, Length } }
+          $rows | Export-Csv after.csv -NoTypeInformation -Encoding UTF8
+          $before = @{}; Import-Csv before.csv | ForEach-Object { $before[$_.p] = 1 }
+          $new = @(); Import-Csv after.csv | ForEach-Object { if (-not $before.ContainsKey($_.p)) { $new += $_ } }
+          $new | Export-Csv newfiles.csv -NoTypeInformation -Encoding UTF8
+          Write-Host "NEW FILES: $($new.Count)"
+          $new | Where-Object { $_.p -match '\.(sys|inf|cat|dll|exe|bin|dat|msi|drv)$' } | Select-Object p,Length | Format-Table -AutoSize | Out-String -Width 400 | Write-Host
+          New-Item -ItemType Directory -Force harvested | Out-Null
+          $new | Where-Object { $_.p -match '\.(sys|inf|cat|bin|dat|drv|dll|exe)$' } | ForEach-Object { try { Copy-Item $_.p "harvested\$([IO.Path]::GetFileName($_.p))" -Force -ErrorAction Stop } catch {} }
+          Get-ChildItem harvested -ErrorAction SilentlyContinue | Select-Object Name,Length | Format-Table -AutoSize | Out-String | Write-Host
+          Get-ChildItem 'C:\Program Files','C:\Program Files (x86)',"$env:ProgramData" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'chimera|euro' } | Select-Object FullName | Out-String | Write-Host
+
+      - name: Extract strings
+        shell: pwsh
+        run: |
+          $rxUrl  = [regex]'https?://[\x21-\x7e]{3,200}'
+          $rxHost = [regex]'[a-zA-Z0-9][a-zA-Z0-9.-]{2,80}\.(com|net|org|hu|eu|cn|io|info|sk|cz)(:[0-9]{1,5})?(/[\x21-\x7e]{0,140})?'
+          $set = New-Object System.Collections.Generic.HashSet[string]
+          Get-ChildItem *.dmp -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "scan $($_.Name) $([math]::Round($_.Length/1MB,1))MB"
+            $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+            foreach ($enc in @([System.Text.Encoding]::ASCII,[System.Text.Encoding]::Unicode)) {
+              $s = $enc.GetString($bytes)
+              foreach ($m in $rxUrl.Matches($s))  { [void]$set.Add($m.Value) }
+              foreach ($m in $rxHost.Matches($s)) { [void]$set.Add($m.Value) }
+            }
+          }
+          $set | Sort-Object | Out-File dump-strings.txt
+          Write-Host "unique: $($set.Count)"
+          $h = New-Object System.Text.StringBuilder
+          Get-ChildItem harvested -File -ErrorAction SilentlyContinue | ForEach-Object {
+            [void]$h.AppendLine("=== $($_.Name) ($($_.Length) bytes) ===")
+            $b = [System.IO.File]::ReadAllBytes($_.FullName)
+            $s = [System.Text.Encoding]::ASCII.GetString($b) + "`n" + [System.Text.Encoding]::Unicode.GetString($b)
+            foreach ($m in $rxUrl.Matches($s))  { [void]$h.AppendLine($m.Value) }
+            foreach ($m in $rxHost.Matches($s)) { [void]$h.AppendLine($m.Value) }
+          }
+          $h.ToString() | Out-File harvested-strings.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimera-unpack
+          path: |
+            i0.png
+            i1.png
+            a0.png
+            a1.png
+            pd.log
+            dumped.txt
+            newfiles.csv
+            dump-strings.txt
+            harvested-strings.txt
+            flows.dump
+            mitm.log
+            dnscache.txt
+            netstat.txt
+            capture.etl
+            harvested/
+          compression-level: 6
+          if-no-files-found: warn
