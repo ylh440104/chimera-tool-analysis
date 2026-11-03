@@ -1,0 +1,82 @@
+name: chimera-drive3
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  drive:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get samples
+        shell: pwsh
+        run: |
+          $base = "${{ github.server_url }}/${{ github.repository }}/releases/download/samples"
+          foreach ($n in @('ChimeraInstaller.exe','ChimeraTool_Authenticator_Driver.exe')) { Invoke-WebRequest "$base/$n" -OutFile $n -TimeoutSec 300 }
+          Get-ChildItem *.exe | Select-Object Name,Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Baseline
+        shell: pwsh
+        run: |
+          $dirs=@($env:TEMP,$env:ProgramData,$env:LOCALAPPDATA,$env:APPDATA,'C:\Program Files','C:\Program Files (x86)','C:\Windows\System32\drivers','C:\Windows\INF','C:\Windows\System32\DriverStore')
+          $rows=foreach($d in $dirs){ if(Test-Path $d){ Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue | Select-Object @{n='p';e={$_.FullName}},Length } }
+          $rows | Export-Csv before.csv -NoTypeInformation -Encoding UTF8
+
+      - name: Start temp snatcher
+        shell: pwsh
+        run: Start-Process pwsh -ArgumentList '-NoProfile','-File',"$PWD\scripts\snatch.ps1" -RedirectStandardOutput snatch.log -PassThru | Select-Object Id | Out-String | Write-Host
+
+      - name: Silent switch probe
+        shell: pwsh
+        timeout-minutes: 10
+        run: pwsh -NoProfile -File "$PWD\scripts\silent.ps1" -Exe 'ChimeraTool_Authenticator_Driver.exe' -Tag 'auth'
+
+      - name: Drive authdrv grid
+        shell: pwsh
+        timeout-minutes: 15
+        run: pwsh -NoProfile -File "$PWD\scripts\drive.ps1" -Exe 'ChimeraTool_Authenticator_Driver.exe' -Tag 'auth' -Rounds 8
+
+      - name: Drive installer grid
+        shell: pwsh
+        timeout-minutes: 22
+        run: pwsh -NoProfile -File "$PWD\scripts\drive.ps1" -Exe 'ChimeraInstaller.exe' -Tag 'inst' -Rounds 10
+
+      - name: Stop snatcher
+        shell: pwsh
+        run: |
+          Get-Process pwsh -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID } | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep 2
+          Get-ChildItem snatched -ErrorAction SilentlyContinue | Select-Object Name,Length | Format-Table -AutoSize | Out-String | Write-Host
+          Get-Content snatch.log -ErrorAction SilentlyContinue | Select-Object -Last 40 | Out-String | Write-Host
+
+      - name: Collect
+        shell: pwsh
+        run: |
+          $dirs=@($env:TEMP,$env:ProgramData,$env:LOCALAPPDATA,$env:APPDATA,'C:\Program Files','C:\Program Files (x86)','C:\Windows\System32\drivers','C:\Windows\INF','C:\Windows\System32\DriverStore')
+          $rows=foreach($d in $dirs){ if(Test-Path $d){ Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue | Select-Object @{n='p';e={$_.FullName}},Length } }
+          $rows | Export-Csv after.csv -NoTypeInformation -Encoding UTF8
+          $b=@{}; Import-Csv before.csv | ForEach-Object { $b[$_.p]=1 }
+          $new=@(); Import-Csv after.csv | ForEach-Object { if(-not $b.ContainsKey($_.p)){ $new += $_ } }
+          $new | Export-Csv newfiles.csv -NoTypeInformation -Encoding UTF8
+          Write-Host "NEW: $($new.Count)"
+          $new | Where-Object { $_.p -match '\.(sys|inf|cat|dll|exe|dat|bin)$' } | Select-Object p,Length | Format-Table -AutoSize | Out-String -Width 400 | Write-Host
+          New-Item -ItemType Directory -Force harvested | Out-Null
+          $new | Where-Object { $_.p -match '\.(sys|inf|cat|dat|bin|dll|exe)$' } | ForEach-Object { try { Copy-Item $_.p "harvested\$([IO.Path]::GetFileName($_.p))" -Force -ErrorAction Stop } catch {} }
+          Get-ChildItem harvested -ErrorAction SilentlyContinue | Select-Object Name,Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimera-drive3
+          path: |
+            *.png
+            newfiles.csv
+            harvested/
+            snatched/
+            snatch.log
+            silent-*.log
+            silent-*.err
+          compression-level: 6
+          if-no-files-found: warn
