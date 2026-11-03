@@ -1,0 +1,75 @@
+name: chimera-drive4
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  ir:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get samples and tools
+        shell: pwsh
+        run: |
+          $base = "${{ github.server_url }}/${{ github.repository }}/releases/download/samples"
+          foreach ($n in @('ChimeraTool_Authenticator_Driver.exe','irsetup_upx.exe')) { Invoke-WebRequest "$base/$n" -OutFile $n -TimeoutSec 300 }
+          Invoke-WebRequest https://download.sysinternals.com/files/Procdump.zip -OutFile pd.zip
+          Expand-Archive pd.zip -DestinationPath pd -Force
+          Get-ChildItem *.exe | Select-Object Name,Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Extract lua and irsetup from sample (static overlay parse)
+        shell: pwsh
+        run: |
+          $bytes=[System.IO.File]::ReadAllBytes('ChimeraTool_Authenticator_Driver.exe')
+          # embedded lua5.1 dll was at 0x15302a len 0x4f000
+          $lua=$bytes[0x15302a..(0x15302a+0x4f000-1)]
+          [System.IO.File]::WriteAllBytes('lua5.1.dll',$lua)
+          Write-Host "lua5.1.dll=$($lua.Length)"
+          Write-Host "sample size=$($bytes.Length)"
+
+      - name: Run irsetup and dump memory
+        shell: pwsh
+        timeout-minutes: 12
+        run: pwsh -NoProfile -File "$PWD\scripts\irsetup_dump.ps1"
+
+      - name: Carve PEs from dumps and irsetup
+        shell: pwsh
+        timeout-minutes: 12
+        run: pwsh -NoProfile -File "$PWD\scripts\carve.ps1"
+
+      - name: String scan of dumped memory for license/driver terms
+        shell: pwsh
+        run: |
+          $rx=[regex]'[\x20-\x7e]{6,120}'
+          $terms='InstallDriver','SQLInstallDriverEx','CreateServiceA','System32\\drivers','\SystemRoot\','Chimera','Authenticator','elg','HASP','Sentinel','.sys','.inf','SetupFactory','irsetup'
+          $out=New-Object System.Text.StringBuilder
+          Get-ChildItem *.dmp -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "scan $($_.Name) $([math]::Round($_.Length/1MB,1))MB"
+            $b=[System.IO.File]::ReadAllBytes($_.FullName)
+            foreach($enc in @([System.Text.Encoding]::ASCII,[System.Text.Encoding]::Unicode)){
+              $s=$enc.GetString($b)
+              foreach($m in $rx.Matches($s)){
+                foreach($t in $terms){ if($m.Value.Contains($t)){ [void]$out.AppendLine($m.Value); break } }
+              }
+            }
+          }
+          $out.ToString() | Select-Object -Unique | Out-File dump-hits.txt
+          Write-Host "hit lines: $((Get-Content dump-hits.txt -ErrorAction SilentlyContinue | Measure-Object -Line).Lines)"
+          Get-Content dump-hits.txt -ErrorAction SilentlyContinue | Select-Object -First 60 | Out-String | Write-Host
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimera-ir
+          path: |
+            *.dmp
+            carved/
+            dump-hits.txt
+            irwork/
+            irsetup-modules.txt
+            irsetup-exit.txt
+            lua5.1.dll
+          compression-level: 6
+          if-no-files-found: warn
