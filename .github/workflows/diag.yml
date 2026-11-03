@@ -1,127 +1,56 @@
 name: chimera-diag
-
-on:
-  workflow_dispatch:
-  push:
-
+true:
+  workflow_dispatch: null
+  push: null
 jobs:
   diag:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
+    - name: Download samples
+      shell: pwsh
+      run: "$base = \"${{ github.server_url }}/${{ github.repository }}/releases/download/samples\"\nforeach ($n in @('ChimeraInstaller.exe','ChimeraTool_Authenticator_Driver.exe')) {\n  Invoke-WebRequest \"$base/$n\" -OutFile $n -TimeoutSec 300\n  Write-Host \"$n $((Get-Item $n).Length)\"\n}\n"
+    - name: Probe binaries statically
+      shell: pwsh
+      run: "foreach ($f in @('installer.exe','authdrv.exe')) {\n  Write-Host \"=== $f ===\"\n  $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $f))\n  # check subsystem and machine\n  $peOff = [BitConverter]::ToInt32($bytes, 0x3c)\n  $machine = [BitConverter]::ToUInt16($bytes, $peOff+4)\n  $magic = [BitConverter]::ToUInt16($bytes, $peOff+24)\n  $subsys = [BitConverter]::ToUInt16($bytes, $peOff+24+68)\n  Write-Host \"  machine=$('{0:X}' -f $machine) magic=$('{0:X}' -f $magic) subsystem=$subsys\"\n  # search WLV markers\n  $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)\n  foreach ($marker in @('.winlice','.boot','WinLicense','Themida','VMProtect','.vmp','.enigma','OREANS')) {\n    $i = $ascii.IndexOf($marker)\n    if ($i -ge 0) { Write-Host \"  MARKER $marker at $i\" }\n  }\n}\n"
+    - name: Run and capture exit codes
+      shell: pwsh
+      run: "$ErrorActionPreference = 'Continue'\nfunction TryRun($exe, $tag) {\n  Write-Host \"=== run $exe ===\"\n  $psi = New-Object System.Diagnostics.ProcessStartInfo\n  $psi.FileName = (Resolve-Path $exe)\n  $psi.WorkingDirectory = (Get-Location).Path\n  $psi.UseShellExecute = $false\n  $psi.RedirectStandardOutput = $true\n  $psi.RedirectStandardError = $true\n  $psi.CreateNoWindow = $false\n  $proc = New-Object System.Diagnostics.Process\n  $proc.StartInfo = $psi\n  $started = $proc.Start()\n  Write-Host \"  started=$started pid=$($proc.Id)\"\n  $exited = $proc.WaitForExit(45000)\n  if ($exited) {\n    Write-Host \"  EXITED code=$($proc.ExitCode)\"\n    \"$tag exit=$($proc.ExitCode)\" | Out-File -Append exits.txt\n    $out = $proc.StandardOutput.ReadToEnd()\n    $err = $proc.StandardError.ReadToEnd()\n    if ($out) { \"--- stdout ---\" ; $out | Out-File -Append \"$tag-stdout.txt\" }\n    if ($err) { \"--- stderr ---\" ; $err | Out-File -Append \"$tag-stderr.txt\" }\n  } else {\n  \
+        \  Write-Host \"  STILL RUNNING after 45s (good sign)\"\n    \"$tag running\" | Out-File -Append exits.txt\n    try {\n      $mods = $proc.Modules | ForEach-Object { $_.ModuleName }\n      $mods | Out-File \"$tag-modules.txt\"\n      Write-Host \"  modules: $($mods.Count)\"\n    } catch { Write-Host \"  module enum failed: $_\" }\n    try {\n      $proc.Kill()\n    } catch {}\n  }\n}\nTryRun 'installer.exe' 'installer'\nStart-Sleep 3\nTryRun 'authdrv.exe' 'authdrv'\n"
+      timeout-minutes: 8
+    - name: Event log for app errors
+      shell: pwsh
+      run: "try {\n  Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-10)} -MaxEvents 40 -ErrorAction SilentlyContinue |\n    Select-Object TimeCreated,ProviderName,Id,LevelDisplayName,Message |\n    Format-List | Out-String | Out-File applog.txt\n} catch { 'no event log' | Out-File applog.txt }\ntry {\n  Get-WinEvent -LogName 'Microsoft-Windows-AppModel-Runtime/Admin' -MaxEvents 20 -ErrorAction SilentlyContinue |\n    Format-List | Out-File -Append applog.txt\n} catch {}\n"
+      timeout-minutes: 4
+    - uses: actions/upload-artifact@v4
+      with:
+        name: chimera-diag
+        path: 'exits.txt
 
-      - name: Download samples
-        shell: pwsh
-        run: |
-          $base = "${{ github.server_url }}/${{ github.repository }}/releases/download/samples"
-          foreach ($n in @('ChimeraInstaller.exe','ChimeraTool_Authenticator_Driver.exe')) {
-            Invoke-WebRequest "$base/$n" -OutFile $n -TimeoutSec 300
-            Write-Host "$n $((Get-Item $n).Length)"
-          }
+          installer-stdout.txt
 
-      - name: Probe binaries statically
-        shell: pwsh
-        run: |
-          foreach ($f in @('installer.exe','authdrv.exe')) {
-            Write-Host "=== $f ==="
-            $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $f))
-            # check subsystem and machine
-            $peOff = [BitConverter]::ToInt32($bytes, 0x3c)
-            $machine = [BitConverter]::ToUInt16($bytes, $peOff+4)
-            $magic = [BitConverter]::ToUInt16($bytes, $peOff+24)
-            $subsys = [BitConverter]::ToUInt16($bytes, $peOff+24+68)
-            Write-Host "  machine=$('{0:X}' -f $machine) magic=$('{0:X}' -f $magic) subsystem=$subsys"
-            # search WLV markers
-            $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
-            foreach ($marker in @('.winlice','.boot','WinLicense','Themida','VMProtect','.vmp','.enigma','OREANS')) {
-              $i = $ascii.IndexOf($marker)
-              if ($i -ge 0) { Write-Host "  MARKER $marker at $i" }
-            }
-          }
+          installer-stderr.txt
 
-      - name: Run and capture exit codes
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          function TryRun($exe, $tag) {
-            Write-Host "=== run $exe ==="
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = (Resolve-Path $exe)
-            $psi.WorkingDirectory = (Get-Location).Path
-            $psi.UseShellExecute = $false
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError = $true
-            $psi.CreateNoWindow = $false
-            $proc = New-Object System.Diagnostics.Process
-            $proc.StartInfo = $psi
-            $started = $proc.Start()
-            Write-Host "  started=$started pid=$($proc.Id)"
-            $exited = $proc.WaitForExit(45000)
-            if ($exited) {
-              Write-Host "  EXITED code=$($proc.ExitCode)"
-              "$tag exit=$($proc.ExitCode)" | Out-File -Append exits.txt
-              $out = $proc.StandardOutput.ReadToEnd()
-              $err = $proc.StandardError.ReadToEnd()
-              if ($out) { "--- stdout ---" ; $out | Out-File -Append "$tag-stdout.txt" }
-              if ($err) { "--- stderr ---" ; $err | Out-File -Append "$tag-stderr.txt" }
-            } else {
-              Write-Host "  STILL RUNNING after 45s (good sign)"
-              "$tag running" | Out-File -Append exits.txt
-              try {
-                $mods = $proc.Modules | ForEach-Object { $_.ModuleName }
-                $mods | Out-File "$tag-modules.txt"
-                Write-Host "  modules: $($mods.Count)"
-              } catch { Write-Host "  module enum failed: $_" }
-              try {
-                $proc.Kill()
-              } catch {}
-            }
-          }
-          TryRun 'installer.exe' 'installer'
-          Start-Sleep 3
-          TryRun 'authdrv.exe' 'authdrv'
+          authdrv-stdout.txt
 
-      - name: Event log for app errors
-        shell: pwsh
-        run: |
-          try {
-            Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-10)} -MaxEvents 40 -ErrorAction SilentlyContinue |
-              Select-Object TimeCreated,ProviderName,Id,LevelDisplayName,Message |
-              Format-List | Out-String | Out-File applog.txt
-          } catch { 'no event log' | Out-File applog.txt }
-          try {
-            Get-WinEvent -LogName 'Microsoft-Windows-AppModel-Runtime/Admin' -MaxEvents 20 -ErrorAction SilentlyContinue |
-              Format-List | Out-File -Append applog.txt
-          } catch {}
+          authdrv-stderr.txt
 
-      - name: Try 7z listing
-        shell: pwsh
-        run: |
-          Invoke-WebRequest https://www.7-zip.org/a/7z2408-x64.exe -OutFile 7z.exe -ErrorAction SilentlyContinue
-          if (Test-Path 7z.exe) {
-            .\7z.exe | Out-Null
-            foreach ($f in @('installer.exe','authdrv.exe')) {
-              Write-Host "=== 7z l $f ==="
-              .\7z.exe l $f 2>&1 | Out-File -Append 7z-listing.txt
-              Write-Host "=== 7z x $f ==="
-              .\7z.exe x $f -o"unpack-$f" -y 2>&1 | Out-File -Append 7z-listing.txt
-            }
-          }
+          installer-modules.txt
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: chimera-diag
-          path: |
-            exits.txt
-            installer-stdout.txt
-            installer-stderr.txt
-            authdrv-stdout.txt
-            authdrv-stderr.txt
-            installer-modules.txt
-            authdrv-modules.txt
-            applog.txt
-            7z-listing.txt
-            unpack-installer.exe/
-            unpack-authdrv.exe/
-          if-no-files-found: warn
+          authdrv-modules.txt
+
+          applog.txt
+
+          7z-listing.txt
+
+          unpack-installer.exe/
+
+          unpack-authdrv.exe/
+
+          '
+        if-no-files-found: warn
+    - name: Try 7z listing (bounded)
+      shell: pwsh
+      run: "Invoke-WebRequest https://www.7-zip.org/a/7z2408-x64.exe -OutFile 7z.exe -ErrorAction SilentlyContinue\nif (-not (Test-Path 7z.exe)) { 'no 7z' | Out-File 7z-listing.txt; exit 0 }\n.\\7z.exe > $null 2>&1\nforeach ($f in @('installer.exe','authdrv.exe')) {\n  Write-Host \"=== 7z l $f ===\"\n  .\\7z.exe l $f 2>&1 | Out-File -Append 7z-listing.txt\n  $z = (Resolve-Path .\\7z.exe).Path\n  $t = (Resolve-Path $f).Path\n  $o = \"$PWD\\unpack-$f\"\n  $job = Start-Job -ScriptBlock { param($zz,$tt,$oo) & $zz x $tt \"-o$oo\" -y 2>&1 } -ArgumentList $z,$t,$o\n  if (Wait-Job $job -Timeout 180) { Receive-Job $job | Out-File -Append 7z-listing.txt } else { Stop-Job $job; \"TIMEOUT extracting $f\" | Out-File -Append 7z-listing.txt }\n  Remove-Job $job -Force -ErrorAction SilentlyContinue\n}\n"
+      timeout-minutes: 6
