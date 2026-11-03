@@ -1,0 +1,83 @@
+name: chimera-drive2
+'on':
+  workflow_dispatch: null
+  push: null
+jobs:
+  drive:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v4
+    - name: Get samples
+      shell: pwsh
+      run: '$base="${{ github.server_url }}/${{ github.repository }}/releases/download/samples"
+
+        foreach($n in @("ChimeraInstaller.exe","ChimeraTool_Authenticator_Driver.exe")){Invoke-WebRequest "$base/$n" -OutFile $n -TimeoutSec 300}
+
+        Invoke-WebRequest https://download.sysinternals.com/files/Procdump.zip -OutFile pd.zip
+
+        Expand-Archive pd.zip -DestinationPath pd -Force
+
+        Get-ChildItem *.exe | Select-Object Name,Length | Format-Table -AutoSize | Out-String | Write-Host'
+    - name: Baseline
+      shell: pwsh
+      run: '$dirs=@("$env:TEMP","$env:ProgramData","$env:LOCALAPPDATA","$env:APPDATA","C:\Program Files","C:\Program Files (x86)","C:\Windows\System32\drivers","C:\Windows\System32\DriverStore")
+
+        $rows=foreach($d in $dirs){if(Test-Path $d){Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue|Select-Object @{n=''p'';e={$_.FullName}},Length}}
+
+        $rows|Export-Csv before.csv -NoTypeInformation -Encoding UTF8
+
+        '
+    - name: Drive authdrv
+      shell: pwsh
+      timeout-minutes: 10
+      env:
+        TARGET_EXE: ChimeraTool_Authenticator_Driver.exe
+        TARGET_TAG: auth
+        TARGET_ITER: '10'
+      run: "\n$ErrorActionPreference='Continue'\nAdd-Type -AssemblyName System.Windows.Forms,System.Drawing\nAdd-Type -AssemblyName UIAutomationClient, UIAutomationTypes\nAdd-Type @\"\nusing System;\nusing System.Runtime.InteropServices;\nusing System.Text;\npublic class W {\n  [DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h);\n  [DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();\n  [DllImport(\"user32.dll\")] public static extern bool GetWindowRect(IntPtr h, out RECT r);\n  [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int x, int y);\n  [DllImport(\"user32.dll\")] public static extern void mouse_event(uint f,int x,int y,int d,IntPtr e);\n  [DllImport(\"user32.dll\")] public static extern void keybd_event(byte k, byte s, uint f, IntPtr e);\n  [DllImport(\"user32.dll\")] public static extern IntPtr FindWindow(string c, string n);\n  [DllImport(\"user32.dll\")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);\n  [DllImport(\"user32.dll\", CharSet=CharSet.Auto)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int m);\n  [DllImport(\"user32.dll\")] public static extern int GetClassName(IntPtr h, StringBuilder s, int m);\n  [DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);\n  public delegate bool EnumProc(IntPtr h, IntPtr l);\n  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L,T,R,B; }\n  public static string T(IntPtr h){ var s=new StringBuilder(512); GetWindowText(h,s,512); return s.ToString(); }\n  public static string C(IntPtr h){ var s=new StringBuilder(256); GetClassName(h,s,256); return s.ToString(); }\n}\n\"@\nfunction Shot($f){$b=New-Object System.Drawing.Bitmap([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width,[System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height);$g=[System.Drawing.Graphics]::FromImage($b);$g.CopyFromScreen(0,0,0,0,$b.Size);$b.Save($f);$g.Dispose();$b.Dispose()}\nfunction Click($x,$y){ [W]::SetCursorPos($x,$y)|Out-Null; Start-Sleep -Milliseconds 250; [W]::mouse_event(2,0,0,0,[IntPtr]::Zero); [W]::mouse_event(4,0,0,0,[IntPtr]::Zero); Write-Host \"  click($x,$y)\" }\nfunction KeySend($vk){ [W]::keybd_event($vk,0,0,[IntPtr]::Zero); Start-Sleep -Milliseconds 80; [W]::keybd_event($vk,0,2,[IntPtr]::Zero) }\n$exe=$env:TARGET_EXE; $tag=$env:TARGET_TAG; $iter=[int]$env:TARGET_ITER\n$p = Start-Process -FilePath $exe -PassThru -WorkingDirectory (Get-Location).Path\nStart-Sleep 20\nfor ($i=0; $i -lt $iter; $i++) {\n  Shot \"$tag-$i.png\"\n  $hwnd = $p.MainWindowHandle\n  if ($hwnd -eq 0) {\n    $roots = New-Object System.Collections.ArrayList\n    [W]::EnumWindows({ param($h,$l) $pid2=0; [W]::GetWindowThreadProcessId($h,[ref]$pid2)|Out-Null; if ($pid2 -eq $p.Id) { $t=[W]::T($h); if ($t) { [void]$script:roots.Add($h) } }; return $true }, [IntPtr]::Zero) | Out-Null\n    if ($roots.Count -gt 0) { $hwnd = $roots[0] }\n  }\n  Write-Host \"iter $i hwnd=$hwnd title='$([W]::T($hwnd))'\"\n  if ($hwnd -ne 0) {\n    [W]::SetForegroundWindow($hwnd)|Out-Null\n    Start-Sleep -Milliseconds 400\n    # 1) UIAutomation button search\n    $clicked=$false\n    try {\n      $el = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)\n      $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)\n      $btns = $el.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)\n      Write-Host \"  uia buttons=$($btns.Count)\"\n      foreach ($b in $btns) {\n        $nm = $b.Current.Name\n        Write-Host \"    uia [$nm]\"\n        if ($nm -match 'Install|Next|Yes|OK|Continue|Agree') {\n          $ip = $b.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)\n          $ip.Invoke(); Write-Host \"    invoked $nm\"; $clicked=$true; break\n        }\n      }\n    } catch { Write-Host \"  uia err: $_\" }\n    # 2) keyboard: Tab+Enter\n    if (-not $clicked) {\n      Write-Host '  keyboard route'\n      KeySend 0x09; Start-Sleep -Milliseconds 300\n      KeySend 0x09; Start-Sleep -Milliseconds 300\n      KeySend 0x0D; Start-Sleep -Milliseconds 300\n      KeySend 0x0D\n      $clicked=$true\n    }\n  }\n  Start-Sleep 10\n}\nShot \"$tag-final.png\"\nWrite-Host '=== procs ==='\nGet-Process | Where-Object { $_.ProcessName -match 'chimera|setup|install|suf_|irsetup|auth|dpinst|devcon' } | Format-Table Id,ProcessName,MainWindowTitle -AutoSize | Out-String | Write-Host\nWrite-Host '=== services ==='\nGet-Service | Where-Object { $_.Name -match 'chimera|auth|dongle|hasp|sentinel|suf' } | Format-Table Name,DisplayName,Status,PathName -AutoSize | Out-String | Write-Host\nWrite-Host '=== drivers recent ==='\nGet-ChildItem 'C:\\\\Windows\\\\System32\\\\drivers' -Filter *.sys -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-15) } | Format-Table Name,Length,LastWriteTime -AutoSize | Out-String | Write-Host\nWrite-Host '=== chimera dirs ==='\nGet-ChildItem 'C:\\\\Program Files','C:\\\\Program Files (x86)',$env:ProgramData,$env:LOCALAPPDATA -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'chimera|euro' } | Select-Object FullName | Out-String | Write-Host\nWrite-Host '=== installed files under Chimera ==='\nGet-ChildItem 'C:\\\\Program Files\\\\Chimera*','C:\\\\Program Files (x86)\\\\Chimera*' -Recurse -File -ErrorAction SilentlyContinue | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 300 | Write-Host\nif ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }\n"
+    - name: Drive installer
+      shell: pwsh
+      timeout-minutes: 18
+      env:
+        TARGET_EXE: ChimeraInstaller.exe
+        TARGET_TAG: inst
+        TARGET_ITER: '16'
+      run: "\n$ErrorActionPreference='Continue'\nAdd-Type -AssemblyName System.Windows.Forms,System.Drawing\nAdd-Type -AssemblyName UIAutomationClient, UIAutomationTypes\nAdd-Type @\"\nusing System;\nusing System.Runtime.InteropServices;\nusing System.Text;\npublic class W {\n  [DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h);\n  [DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();\n  [DllImport(\"user32.dll\")] public static extern bool GetWindowRect(IntPtr h, out RECT r);\n  [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int x, int y);\n  [DllImport(\"user32.dll\")] public static extern void mouse_event(uint f,int x,int y,int d,IntPtr e);\n  [DllImport(\"user32.dll\")] public static extern void keybd_event(byte k, byte s, uint f, IntPtr e);\n  [DllImport(\"user32.dll\")] public static extern IntPtr FindWindow(string c, string n);\n  [DllImport(\"user32.dll\")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);\n  [DllImport(\"user32.dll\", CharSet=CharSet.Auto)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int m);\n  [DllImport(\"user32.dll\")] public static extern int GetClassName(IntPtr h, StringBuilder s, int m);\n  [DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);\n  public delegate bool EnumProc(IntPtr h, IntPtr l);\n  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L,T,R,B; }\n  public static string T(IntPtr h){ var s=new StringBuilder(512); GetWindowText(h,s,512); return s.ToString(); }\n  public static string C(IntPtr h){ var s=new StringBuilder(256); GetClassName(h,s,256); return s.ToString(); }\n}\n\"@\nfunction Shot($f){$b=New-Object System.Drawing.Bitmap([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width,[System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height);$g=[System.Drawing.Graphics]::FromImage($b);$g.CopyFromScreen(0,0,0,0,$b.Size);$b.Save($f);$g.Dispose();$b.Dispose()}\nfunction Click($x,$y){ [W]::SetCursorPos($x,$y)|Out-Null; Start-Sleep -Milliseconds 250; [W]::mouse_event(2,0,0,0,[IntPtr]::Zero); [W]::mouse_event(4,0,0,0,[IntPtr]::Zero); Write-Host \"  click($x,$y)\" }\nfunction KeySend($vk){ [W]::keybd_event($vk,0,0,[IntPtr]::Zero); Start-Sleep -Milliseconds 80; [W]::keybd_event($vk,0,2,[IntPtr]::Zero) }\n$exe=$env:TARGET_EXE; $tag=$env:TARGET_TAG; $iter=[int]$env:TARGET_ITER\n$p = Start-Process -FilePath $exe -PassThru -WorkingDirectory (Get-Location).Path\nStart-Sleep 20\nfor ($i=0; $i -lt $iter; $i++) {\n  Shot \"$tag-$i.png\"\n  $hwnd = $p.MainWindowHandle\n  if ($hwnd -eq 0) {\n    $roots = New-Object System.Collections.ArrayList\n    [W]::EnumWindows({ param($h,$l) $pid2=0; [W]::GetWindowThreadProcessId($h,[ref]$pid2)|Out-Null; if ($pid2 -eq $p.Id) { $t=[W]::T($h); if ($t) { [void]$script:roots.Add($h) } }; return $true }, [IntPtr]::Zero) | Out-Null\n    if ($roots.Count -gt 0) { $hwnd = $roots[0] }\n  }\n  Write-Host \"iter $i hwnd=$hwnd title='$([W]::T($hwnd))'\"\n  if ($hwnd -ne 0) {\n    [W]::SetForegroundWindow($hwnd)|Out-Null\n    Start-Sleep -Milliseconds 400\n    # 1) UIAutomation button search\n    $clicked=$false\n    try {\n      $el = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)\n      $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)\n      $btns = $el.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)\n      Write-Host \"  uia buttons=$($btns.Count)\"\n      foreach ($b in $btns) {\n        $nm = $b.Current.Name\n        Write-Host \"    uia [$nm]\"\n        if ($nm -match 'Install|Next|Yes|OK|Continue|Agree') {\n          $ip = $b.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)\n          $ip.Invoke(); Write-Host \"    invoked $nm\"; $clicked=$true; break\n        }\n      }\n    } catch { Write-Host \"  uia err: $_\" }\n    # 2) keyboard: Tab+Enter\n    if (-not $clicked) {\n      Write-Host '  keyboard route'\n      KeySend 0x09; Start-Sleep -Milliseconds 300\n      KeySend 0x09; Start-Sleep -Milliseconds 300\n      KeySend 0x0D; Start-Sleep -Milliseconds 300\n      KeySend 0x0D\n      $clicked=$true\n    }\n  }\n  Start-Sleep 10\n}\nShot \"$tag-final.png\"\nWrite-Host '=== procs ==='\nGet-Process | Where-Object { $_.ProcessName -match 'chimera|setup|install|suf_|irsetup|auth|dpinst|devcon' } | Format-Table Id,ProcessName,MainWindowTitle -AutoSize | Out-String | Write-Host\nWrite-Host '=== services ==='\nGet-Service | Where-Object { $_.Name -match 'chimera|auth|dongle|hasp|sentinel|suf' } | Format-Table Name,DisplayName,Status,PathName -AutoSize | Out-String | Write-Host\nWrite-Host '=== drivers recent ==='\nGet-ChildItem 'C:\\\\Windows\\\\System32\\\\drivers' -Filter *.sys -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-15) } | Format-Table Name,Length,LastWriteTime -AutoSize | Out-String | Write-Host\nWrite-Host '=== chimera dirs ==='\nGet-ChildItem 'C:\\\\Program Files','C:\\\\Program Files (x86)',$env:ProgramData,$env:LOCALAPPDATA -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'chimera|euro' } | Select-Object FullName | Out-String | Write-Host\nWrite-Host '=== installed files under Chimera ==='\nGet-ChildItem 'C:\\\\Program Files\\\\Chimera*','C:\\\\Program Files (x86)\\\\Chimera*' -Recurse -File -ErrorAction SilentlyContinue | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 300 | Write-Host\nif ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }\n"
+    - name: Collect
+      shell: pwsh
+      run: '$dirs=@("$env:TEMP","$env:ProgramData","$env:LOCALAPPDATA","$env:APPDATA","C:\Program Files","C:\Program Files (x86)","C:\Windows\System32\drivers","C:\Windows\System32\DriverStore")
+
+        $rows=foreach($d in $dirs){if(Test-Path $d){Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue|Select-Object @{n=''p'';e={$_.FullName}},Length}}
+
+        $rows|Export-Csv after.csv -NoTypeInformation -Encoding UTF8
+
+        $b=@{};Import-Csv before.csv|ForEach-Object{$b[$_.p]=1}
+
+        $new=@();Import-Csv after.csv|ForEach-Object{if(-not $b.ContainsKey($_.p)){$new+= $_}}
+
+        $new|Export-Csv newfiles.csv -NoTypeInformation -Encoding UTF8
+
+        Write-Host "NEW: $($new.Count)"
+
+        $new|Where-Object{$_.p -match ''\.(sys|inf|cat|dll|exe|dat|bin)$''}|Select-Object p,Length|Format-Table -AutoSize|Out-String -Width 400|Write-Host
+
+        New-Item -ItemType Directory -Force harvested|Out-Null
+
+        $new|Where-Object{$_.p -match ''\.(sys|inf|cat|dat|bin|dll|exe)$''}|ForEach-Object{try{Copy-Item $_.p "harvested\$([IO.Path]::GetFileName($_.p))" -Force -ErrorAction Stop}catch{}}
+
+        Get-ChildItem harvested|Select-Object Name,Length|Format-Table -AutoSize|Out-String|Write-Host
+
+        '
+    - uses: actions/upload-artifact@v4
+      with:
+        name: chimera-drive2
+        path: '*.png
+
+          newfiles.csv
+
+          harvested/
+
+          '
+        compression-level: 6
+        if-no-files-found: warn
