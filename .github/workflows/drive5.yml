@@ -1,0 +1,94 @@
+name: chimera-drive5
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  hunt:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get samples and tools
+        shell: pwsh
+        run: |
+          $base = "${{ github.server_url }}/${{ github.repository }}/releases/download/samples"
+          Invoke-WebRequest "$base/ChimeraTool_Authenticator_Driver.exe" -OutFile 'ChimeraTool_Authenticator_Driver.exe' -TimeoutSec 300
+          Invoke-WebRequest https://download.sysinternals.com/files/Procdump.zip -OutFile pd.zip
+          Expand-Archive pd.zip -DestinationPath pd -Force
+          Get-ChildItem *.exe | Select-Object Name,Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Hunt irsetup child and dump
+        shell: pwsh
+        timeout-minutes: 18
+        run: pwsh -NoProfile -File "$PWD\scripts\hunt_irsetup.ps1"
+
+      - name: Scan dumps for driver artefacts
+        shell: pwsh
+        run: |
+          $terms='InstallDriver','SQLInstallDriverEx','CreateServiceA','System32\drivers','\SystemRoot\','Chimera','Authenticator','.sys','.inf','irsetup.dat','SetupFactory'
+          $out=New-Object System.Text.StringBuilder
+          Get-ChildItem hunt -Filter *.dmp -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "scan $($_.Name) $([math]::Round($_.Length/1MB,1))MB"
+            $b=[System.IO.File]::ReadAllBytes($_.FullName)
+            foreach($enc in @([System.Text.Encoding]::ASCII,[System.Text.Encoding]::Unicode)){
+              $s=$enc.GetString($b)
+              foreach($m in ([regex]'[\x20-\x7e]{6,150}').Matches($s)){
+                foreach($t in $terms){ if($m.Value.Contains($t)){ [void]$out.AppendLine($m.Value); break } }
+              }
+            }
+          }
+          $out.ToString() | Select-Object -Unique | Out-File hunt-hits.txt
+          Get-Content hunt-hits.txt -ErrorAction SilentlyContinue | Select-Object -First 80 | Out-String | Write-Host
+
+      - name: Carve PEs from dumped irsetup
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          New-Item -ItemType Directory -Force carved | Out-Null
+          Get-ChildItem hunt -Filter *.dmp -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "carve $($_.Name)"
+            $bytes=[System.IO.File]::ReadAllBytes($_.FullName)
+            $found=0
+            for($i=0; $i -lt $bytes.Length-0x40; $i++){
+              if($bytes[$i] -eq 0x4D -and $bytes[$i+1] -eq 0x5A){
+                $lf=[BitConverter]::ToInt32($bytes,$i+0x3c)
+                if($lf -gt 0 -and ($i+$lf+4) -lt $bytes.Length -and $bytes[$i+$lf] -eq 0x50 -and $bytes[$i+$lf+1] -eq 0x45){
+                  $nsec=[BitConverter]::ToUInt16($bytes,$i+$lf+6)
+                  $szopt=[BitConverter]::ToUInt16($bytes,$i+$lf+20)
+                  $chars=[BitConverter]::ToUInt16($bytes,$i+$lf+22)
+                  if($nsec -gt 0 -and $nsec -lt 20 -and $szopt -gt 0){
+                    $soff=$i+$lf+24+$szopt; $maxend=$i; $ok=$true
+                    for($k=0;$k -lt $nsec;$k++){
+                      $e=$soff+$k*40
+                      if($e+40 -gt $bytes.Length){ $ok=$false; break }
+                      $rs=[BitConverter]::ToInt32($bytes,$e+16); $ra=[BitConverter]::ToInt32($bytes,$e+20)
+                      if($ra -gt 0 -and $rs -gt 0){ $en=$i+$ra+$rs; if($en -gt $maxend){ $maxend=$en } }
+                    }
+                    if($ok -and ($maxend-$i) -gt 0x800 -and $maxend -le $bytes.Length){
+                      $isDll=($chars -band 0x2000) -ne 0
+                      $nm="carved\c_$('{0:X}' -f $i)_$(if($isDll){'dll'}else{'exe'}).bin"
+                      [System.IO.File]::WriteAllBytes($nm, $bytes[$i..($maxend-1)])
+                      Write-Host "  PE 0x$('{0:X}' -f $i) nsec=$nsec dll=$isDll size=$($maxend-$i)"
+                      $found++
+                      if($found -ge 30){ break }
+                    }
+                  }
+                }
+              }
+            }
+            Write-Host "  carved=$found"
+          }
+          Get-ChildItem carved -ErrorAction SilentlyContinue | Select-Object Name,Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimera-hunt
+          path: |
+            hunt/
+            hunt-hits.txt
+            carved/
+          compression-level: 6
+          if-no-files-found: warn
